@@ -1,0 +1,496 @@
+---
+title: "ANALYSIS MPA HISTORICAL PERIODS"
+author: "Umberto Maggiore"
+date: "2023-01-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### START ANALYSES WITH COMPETING RISK AND INTERMEDIATE STATES
+load packages
+```{r, message=FALSE, warning = FALSE }
+
+rm( list=ls() )
+library(tidyverse)
+library(survival)
+library(survminer)
+library(survival)
+library(splines)
+library(kidney.epi)
+library(cmprsk)
+library(mstate)
+library(ggsci)
+library(cowplot)
+
+### Analysis on Death
+
+setwd("C:\\Documenti\\Sinico\\Martina Uzzo")
+library(haven)
+MPADB <- read_dta("MPADB.dta")
+MPADB  <- MPADB %>%
+  filter(!is.na(timetodialysis), !is.na(timetodeath))
+
+## Kaplan-Meier plots for death
+km.fit <- survfit(Surv(timetodeath, death) ~ PERIOD, data = MPADB)
+attr(km.fit$strata,'names') <- c('1980-2001', '2002-2022')  
+
+p <- ggsurvplot(km.fit ,data=MPADB, pval.method = TRUE, 
+                pval = TRUE, palette = 'lancet', risk.table = TRUE,
+                xlab = 'Month since Diagnosis',ylab = 'Patient survival', xlim=c(0,96), 
+                ylim = c(0,1), 
+                break.x.by = 12, legend.title="",
+                legend.labs=c("1980-2001", "2002-2022"),  
+                size = 1.5) +
+                theme_survminer(
+                    font.main = 14,
+                    font.x = 14,
+                    font.y = 14,
+                    font.tickslab = 12,
+                    font.legend = 14
+                    )
+  p$plot$theme$panel.grid.major <- 
+    element_line(colour = "grey70", size = 0.2)
+
+  grid.draw.ggsurvplot <- function(x){
+  survminer:::print.ggsurvplot(x, newpage = FALSE)
+  }
+p
+ggsave("km_patient_survival.png", plot = p, 
+       dpi=600, width = 8, height = 7, units = "in")
+
+## Adjusted Cox PH multiple regression for mortality
+cox.fit <- coxph(Surv(timetodeath, death) ~ PERIOD +
+                   I(agediagn/15)+ I(eGFR/25) + constitutional + LUNG + pns,
+                 data = MPADB)
+# test PH assumption
+cox.zph(cox.fit)
+# Disoplay estimates
+summary(cox.fit)
+# round estimates to 2 digits
+round(exp(cbind(HR = coef(cox.fit), confint(cox.fit))),2)
+
+
+## Cumulative Incidence 1st Event ESRD/DEATH (Aalen−Johansen estimator)
+
+setwd("C:\\Documenti\\Sinico\\Martina Uzzo")
+library(haven)
+MPADB_CMPRSK_ESRD_DEATH <- read_dta("MPADB_CMPRSK_ESRD_DEATH.dta")
+MPADB_CMPRSK_ESRD_DEATH  <- MPADB_CMPRSK_ESRD_DEATH %>%
+  filter(!is.na(timetodialysis), !is.na(timetodeath))
+
+# recode variable STATUS and make it factor for colours in the plot
+MPADB_CMPRSK_ESRD_DEATH.1 <- MPADB_CMPRSK_ESRD_DEATH %>%
+  mutate( STATUS = ifelse(STATUS == 1, 3, STATUS),
+          STATUS = ifelse(STATUS == 0, 1, STATUS),
+          STATUS = STATUS  - 1 ,
+          STATUS = factor(x= STATUS, levels=sort(unique(STATUS)), 
+                          labels = c( "Censor", "ESKD", "Death")),
+          PERIOD = factor(x =PERIOD, levels = c(1,2), 
+                          labels = c("1980-2001", "2002-2022")))
+
+# calculate cumulative incidence 1st event (Aalen−Johansen)
+aj.ci.curve <- cuminc(MPADB_CMPRSK_ESRD_DEATH.1$FUP, 
+                      MPADB_CMPRSK_ESRD_DEATH.1$STATUS, 
+                      MPADB_CMPRSK_ESRD_DEATH.1$PERIOD)
+
+# generate plot cumulative incidence
+aj.ci.plot <-  ggcompetingrisks(aj.ci.curve)
+
+aj.ci.plot <-  ggpar(aj.ci.plot, xlim = c(0,96), main = "", 
+                     ylab = "Crude Cumulative Incidence (1st Event)", 
+                     xlab = "Month since Diagnosis") 
+#                    legend.title = "Event")
+aj.ci.plot + scale_colour_jco() + 
+  geom_line(linewidth = 1.5) +
+  scale_x_continuous(breaks = seq(0, 96, by = 12)) +
+  scale_y_continuous(breaks = seq(0, .80, by = .10)) +
+  theme(panel.grid.major = element_line(colour = "grey70", size = 0.2), 
+       axis.text.y = element_text(size = 11),
+       axis.text.x = element_text(size = 11),
+       axis.title.y = element_text(size = 15),
+       axis.title.x = element_text(size = 14), 
+       legend.text = element_text(size = 14),
+       strip.text.x = element_text(size = 14)) +
+  scale_colour_jco(labels = c("No Event" , "ESKD" , "Death")) +
+  guides(colour = guide_legend( title = NULL )) 
+ggsave("cumulative_incidence.png", dpi=600, width = 8, height = 7, units = "in")
+
+
+# transform to factors
+MPADB_CMPRSK_ESRD_DEATH <- MPADB_CMPRSK_ESRD_DEATH %>%
+  mutate( 
+    STATUS = factor(x= STATUS, levels=sort(unique(STATUS)), 
+                    labels = c( "Censor", "ESKD", "Death")),
+    PERIOD = factor(x =PERIOD, levels = c(1,2), 
+                    labels = c("1980-2001", "2002-2022")))
+# generate dataset for Fine & Gray regression
+data_fg <- finegray(Surv(FUP, STATUS) ~ ., data =  MPADB_CMPRSK_ESRD_DEATH, 
+                    etype = "ESKD")
+
+# Fit Fine & Gray regression (Subhazard ratio of ESKD)
+# Death as competing risks
+
+# Crude analysis
+finegray.ESKD.crude <- coxph(Surv(fgstart, fgstop, fgstatus) ~ 
+                             PERIOD, 
+                           data = data_fg, weight= fgwt)
+summary(finegray.ESKD.crude)
+# round estimates to 2 digits
+round(exp(cbind(HR = coef(finegray.ESKD.crude), 
+                confint(finegray.ESKD.crude))),2)
+
+# Adjusted analysis
+finegray.ESKD.adj <- coxph(Surv(fgstart, fgstop, fgstatus) ~ 
+                            PERIOD + 
+                            I(agediagn/15)+ I(eGFR/25) + constitutional + 
+                            LUNG + pns, 
+                            data = data_fg, weight= fgwt)
+summary(finegray.ESKD.adj)
+# round estimates to 2 digits
+round(exp(cbind(HR = coef(finegray.ESKD.adj), 
+                confint(finegray.ESKD.adj))),2)
+
+
+### Rate model Simultaneous cause-specific hazard 1st Event (Not reported)
+
+setwd("C:\\Documenti\\Sinico\\Martina Uzzo")
+library(haven)
+MPADB_CMPRSK_ESRD_DEATH <- read_dta("MPADB_CMPRSK_ESRD_DEATH.dta")
+MPADB_CMPRSK_ESRD_DEATH  <- MPADB_CMPRSK_ESRD_DEATH %>%
+  filter(!is.na(timetodialysis), !is.na(timetodeath))
+
+# transform to factors and prepare datset
+MPADB_CMPRSK_ESRD_DEATH <- MPADB_CMPRSK_ESRD_DEATH %>%
+  mutate(STATUS = factor(x= STATUS, levels=sort(unique(STATUS)), 
+                         labels = c( "Censor", "ESKD", "Death")),
+         PERIOD = factor(x =PERIOD, levels = c(1,2), 
+                         labels = c("1980-2001", "2002-2022")))
+
+MPADB_CMPRSK_ESRD_DEATH  <- MPADB_CMPRSK_ESRD_DEATH %>%
+  filter(!is.na(timetodialysis), !is.na(timetodeath)) %>%
+  select(id, timetodialysis, timetodeath, 
+         esrd, death,
+         PERIOD, agediagn, SEX, eGFR, constitutional, 
+         LUNG, pns, FUP, STATUS)
+MPADB_CMPRSK_ESRD_DEATH <- 
+  MPADB_CMPRSK_ESRD_DEATH[complete.cases(MPADB_CMPRSK_ESRD_DEATH),]
+
+## Method 1: duplicate records (interaction term ratio of HR death to HR ESKD)
+data_new_2 <- MPADB_CMPRSK_ESRD_DEATH %>% 
+  slice(rep(1:n(), each = 2))
+
+# Map rows for either outcome (TYPE) and generate the status variable (FAIL)
+data_new_2 <- data_new_2 %>%
+  group_by(id) %>% 
+  mutate(TYPE = row_number()) %>%
+  mutate(TYPE = factor(x = TYPE, levels = c(1,2), 
+                       labels = c("ESKD", "Death"))) %>% 
+  mutate(FAIL = ifelse(as.character(STATUS) == as.character(TYPE),1,0))
+
+# crude model
+joint.rate.crude.model <- coxph(Surv(FUP, FAIL) ~ (PERIOD)*strata(TYPE),
+                                data = data_new_2)
+
+summary(joint.rate.crude.model)
+
+# adjusted model
+joint.rate.model <- coxph(Surv(FUP, FAIL) ~ 
+                            (PERIOD + SEX + I(agediagn/15) +   I(eGFR/25) + 
+                               constitutional + LUNG + pns)*strata(TYPE),
+                          data = data_new_2)
+summary(joint.rate.model)
+
+## Method 2: parameterization with no interaction (the model is the same):
+
+# crude model
+ns.rate.crude.model <- coxph(Surv(FUP, STATUS) ~ PERIOD, 
+                             data=MPADB_CMPRSK_ESRD_DEATH,
+                             id=id)
+summary(ns.rate.crude.model)
+
+# adjusted model
+ns.rate.model <- coxph(Surv(FUP, STATUS) ~ 
+                         PERIOD + SEX + I(agediagn/15) + I(eGFR/25) + 
+                         constitutional + LUNG + pns, 
+                       data=MPADB_CMPRSK_ESRD_DEATH,
+                       id=id)
+summary(ns.rate.model)
+
+# Check the two models are the same
+all.equal(joint.rate.crude.model$loglik, ns.rate.crude.model$loglik)
+all.equal(joint.rate.model$loglik, ns.rate.model$loglik)
+
+
+### Multistate models  (not including relapse)
+
+setwd("C:\\Documenti\\Sinico\\Martina Uzzo")
+library(haven)
+MPADB_MULTISTATE <- read_dta("MPADB_MULTISTATE.dta")
+# as above + select variables and use comple cases
+MPADB_MULTISTATE  <- MPADB_MULTISTATE %>%
+  filter(!is.na(timetodialysis), !is.na(timetodeath)) %>%
+  select(id, timetodialysis, timetodeath, 
+         esrd, death,
+         PERIOD, agediagn, eGFR, constitutional, 
+         LUNG, pns)
+
+
+# check the numbers
+MPADB_MULTISTATE %>% 
+  group_by(PERIOD, esrd, death) %>% 
+  summarise(N = n(), Percentage = n()) %>% 
+  group_by(PERIOD) %>% 
+  mutate(Tot = sum(Percentage),Percentage=Percentage/sum(Percentage)*100)
+
+
+# generate transition matrix
+tmat <- transMat(x = list(c(2,3), c(3), c()) , 
+                 names = c("Start","ESKD", "Death"))
+tmat
+
+# generate multistate dataset
+data_new_ms <- msprep(time = c(NA,"timetodialysis","timetodeath"),
+                      status = c(NA, "esrd", "death"),
+                      data = MPADB_MULTISTATE,                     
+                      id = "id",
+                      keep = c("PERIOD", "agediagn", "eGFR", "constitutional", 
+                               "LUNG", "pns"),
+                      trans = tmat
+    )
+
+# plot transition state in each period
+data_new_ms.1 <- data_new_ms %>%
+  filter(PERIOD == 1)
+data_new_ms.2 <- data_new_ms %>%
+  filter(PERIOD == 2)
+# all patients pooled
+NA.surv <- coxph(Surv(Tstart,Tstop, status) ~ strata(trans), 
+                 data = data_new_ms)
+NA.mst <- msfit(NA.surv, vartype = "greenwood", trans = tmat)
+Prob.mst <- probtrans(NA.mst, predt= 0, method = "greenwood")
+plot(Prob.mst, type = "single", use.ggplot = TRUE, conf.int = 0) +
+   labs(title = "All Patients Pooled")
+# period 1980-2001
+NA.surv.1 <- coxph(Surv(Tstart,Tstop, status) ~ strata(trans), 
+                   data = data_new_ms.1)
+NA.mst.1 <- msfit(NA.surv.1, vartype = "greenwood", trans = tmat)
+Prob.mst.1 <- probtrans(NA.mst.1, predt= 0, method = "greenwood")
+plot(Prob.mst.1, type = "single", use.ggplot = TRUE, conf.int = 0) +
+  labs(title = "Period 1980-2001")
+# period 2002-2022
+NA.surv.2 <- coxph(Surv(Tstart,Tstop, status) ~ strata(trans), 
+                   data = data_new_ms.2)
+NA.mst.2 <- msfit(NA.surv.2, vartype = "greenwood", trans = tmat)
+Prob.mst.2 <- probtrans(NA.mst.2, predt= 0, method = "greenwood")
+plot(Prob.mst.2, type = "single", use.ggplot = TRUE, conf.int = 0) +
+  labs(title = "Period 2002-2022")
+
+# prepare dataset numbering covariate for each state for non common effect
+covs <- c("PERIOD", "agediagn", "eGFR", "constitutional", "LUNG", "pns")
+# Note: the index "i" indicates  the effect of the covariate on transition "i"
+data_new_ms <- expand.covs(data_new_ms, covs)
+
+## crude Cox PH multistate model
+ms.cox.model.sepcoef.crude <- coxph(Surv(time, status) ~ PERIOD.1 + PERIOD.2 +
+                                      PERIOD.3  +
+                                      strata(trans), data = data_new_ms)
+# test PH assumption
+cox.zph(ms.cox.model.sepcoef.crude)
+# show the estimates of the PERIOD on 
+# Note: transition 1 (start-> ESKD) 2 (start -> Death) 3 (ESKD -> Death)
+summary(ms.cox.model.sepcoef.crude)
+# round estimates to 2 digits
+round(exp(cbind(HR = coef(ms.cox.model.sepcoef.crude), confint(ms.cox.model.sepcoef.crude))),2)
+# Check that robust S.E. makes no major difference
+ms.cox.model.robust.sepcoef.crude <- coxph(Surv(time, status) ~ 
+                                             PERIOD.1 + PERIOD.2 +
+                                             PERIOD.3  +
+                                             strata(trans) + cluster(id), 
+                                           data = data_new_ms)
+summary(ms.cox.model.robust.sepcoef.crude)
+
+
+## Adjusted Cox PH Multistate model; common covariates for each state
+ms.cox.model.sepcoef.adj <- coxph(Surv(time, status) ~ 
+                                    PERIOD.1 + PERIOD.2 + PERIOD.3  + 
+                                    I(agediagn/15) +
+                                    I(eGFR/25) +
+                                    constitutional +
+                                    LUNG +
+                                    pns + 
+                                    + strata(trans), data = data_new_ms)
+
+# test PH assumption
+cox.zph(ms.cox.model.sepcoef.adj)
+# Show the estimates 
+summary(ms.cox.model.sepcoef.adj)
+# round estimates to 2 digits
+round(exp(cbind(HR = coef(ms.cox.model.sepcoef.adj), confint(ms.cox.model.sepcoef.adj))),2)
+# Check that robust S.E. makes no major difference
+ms.cox.model.robust.sepcoef.adj <- coxph(Surv(time, status) ~ 
+                                           PERIOD.1 + PERIOD.2 + PERIOD.3  + 
+                                           I(agediagn/15) +
+                                           I(eGFR/25) +
+                                           constitutional +
+                                           LUNG +
+                                           pns + 
+                                           + strata(trans) + cluster(id), 
+                                         data = data_new_ms)
+
+# Show the estimates 
+summary(ms.cox.model.robust.sepcoef.adj)
+# round estimates to 2 digits
+round(exp(cbind(HR = coef(ms.cox.model.robust.sepcoef.adj), confint(ms.cox.model.robust.sepcoef.adj))),2)
+
+## Plot transtition probabilities
+# Predict probability (crude) of each start in each Period
+msf.df.period.1 <- data.frame(
+  PERIOD.1 = c(1,0,0),
+  PERIOD.2 = c(0,1,0),
+  PERIOD.3 = c(0,0,1),
+  strata = c(1,2,3),
+  trans = c(1,2,3)
+)
+msf.fit.period.1 <- msfit(
+  object = ms.cox.model.sepcoef.crude, 
+  newdata = msf.df.period.1, 
+  trans = tmat
+)
+msf.df.period.2 <- data.frame(
+  PERIOD.1 = c(2,0,0),
+  PERIOD.2 = c(0,2,0),
+  PERIOD.3 = c(0,0,2),
+  strata = c(1,2,3),
+  trans = c(1,2,3)
+)
+msf.fit.period.2 <- msfit(
+  object = ms.cox.model.sepcoef.crude, 
+  newdata = msf.df.period.2, 
+  trans = tmat
+)
+
+pt.period.1 <- probtrans(msf.fit.period.1, predt = 0)
+plot(pt.period.1, use.ggplot = TRUE) +
+  labs(title = "Probability of the States Period 1980-2001")
+pt.period.2 <- probtrans(msf.fit.period.2, predt = 0)
+plot(pt.period.2, use.ggplot = TRUE) +
+  labs(title = "Probability of the States Period 2002-2022")
+
+# make the plot
+vis.mirror.pt(
+  x = list(pt.period.1, pt.period.2),
+  titles = c("1980-2001", "2002-2022"),
+  xlab = "Month since Diagnosis",
+  ylab = "Crude Probability of the Condition",
+  size_titles = 5.5,
+  horizon = 96
+  ) + 
+  theme(axis.text.y = element_text(size = 11),
+       axis.text.x = element_text(size = 11), 
+       axis.title.y = element_text(size = 15), 
+       axis.title.x = element_text(size = 14),  
+       legend.text = element_text(size = 14)) +
+  scale_fill_jco(labels = c("No Event" , "ESKD" , "Death")) +
+  guides(fill = guide_legend( title = NULL )) 
+
+ggplot2::ggsave("mirrored_ms_probabilities.png", dpi=600, width = 5.8, height = 6.0)
+
+
+# Additional look: check State Probability plots
+plot(msf.fit.period.1, type = "separate", use.ggplot = TRUE, 
+     scale_type = "fixed") +
+     labs(title = "Cumulative Hazard Transition Period 1980-2001")
+plot(msf.fit.period.2, type = "separate", use.ggplot = TRUE, 
+     scale_type = "fixed") +
+  labs(title = "Cumulative Hazard Transition Period 2002-2022")
+
+
+vis.multiple.pt(
+  x = list(pt.period.1, pt.period.2), 
+  from = 1,
+  to = 3, 
+  conf.type = "none",
+  cols = c(1, 2),
+  labels = c("1980-2001", "2002-2022"),
+  legend.title = "Periods"
+  ) +
+  labs(title = "From Start to Death in the Two Periods")
+
+vis.multiple.pt(
+  x = list(pt.period.1, pt.period.2), 
+  from = 1,
+  to = 2, 
+  conf.type = "none",
+  cols = c(1, 2),
+  labels = c("1980-2001", "2002-2022"),
+  legend.title = "Periods"
+   ) +
+  labs(title = "From Start to ESKD in the Two Periods")
+
+
+vis.multiple.pt(
+  x = list(pt.period.1, pt.period.2), 
+  from = 2,
+  to = 3, 
+  conf.type = "none",
+  cols = c(1, 2),
+  labels = c("1980-2001", "2002-2022"),
+  legend.title = "Periods"
+ )  +
+  labs(title = "From ESKD to Death in the Two Periods")
+
+
+
+### Fine & Gray competing risk regression for recurrence (not included)
+
+setwd("C:\\Documenti\\Sinico\\Martina Uzzo")
+library(haven)
+MPADB_CMPRSK_RELAPSE_ESRD_DEATH <- read_dta("MPADB_CMPRSK_RELAPSE_ESRD_DEATH.dta")
+MPADB_CMPRSK_RELAPSE_ESRD_DEATH  <- MPADB_CMPRSK_RELAPSE_ESRD_DEATH %>%
+  filter(!is.na(timetodialysis), !is.na(timetodeath))
+
+# transform to factors
+MPADB_CMPRSK_RELAPSE_ESRD_DEATH <- MPADB_CMPRSK_RELAPSE_ESRD_DEATH %>%
+  mutate(STATUS = factor(x= STATUS, levels=sort(unique(STATUS)), 
+                         labels = c( "Censor", "ESKD", "Death", "Relapse")),
+         PERIOD = factor(x =PERIOD, levels = c(1,2), 
+                         labels = c("1980-2001", "2002-2022")))
+
+# check the numbers
+MPADB_CMPRSK_RELAPSE_ESRD_DEATH %>% 
+  group_by(PERIOD, esrd, death, relapse) %>% 
+  summarise(N = n(), Percentage = n()) %>% 
+  group_by(PERIOD) %>% 
+  mutate(Tot = sum(Percentage),Percentage=Percentage/sum(Percentage)*100)
+
+# generate dataset for Fine & Gray regression
+data_fg <- finegray(Surv(FUP, STATUS) ~ ., data = MPADB_CMPRSK_RELAPSE_ESRD_DEATH, 
+                    etype = "Relapse")
+
+
+# Fit Fine & Gray regression (Subhazard ratio of (first) relapse) - Crude
+# (1st) ESKD and death as competing risks
+finegray.relapse.crude <- coxph(Surv(fgstart, fgstop, fgstatus) ~ 
+                            PERIOD, 
+                          data = data_fg, weight= fgwt)
+summary(finegray.relapse.crude)
+# round estimates to 2 digits
+round(exp(cbind(HR = coef(finegray.relapse.crude), 
+                confint(finegray.relapse.crude))),2)
+
+# Fit Fine & Gray regression (Subhazard ratio of (first) relapse) -Adjusted
+# (1st) ESKD and death as competing risks
+finegray.relapse.adj <- coxph(Surv(fgstart, fgstop, fgstatus) ~ 
+                            PERIOD + I(agediagn/15)+ I(eGFR/25) + constitutional + 
+                            LUNG + pns, 
+                          data = data_fg, weight= fgwt)
+summary(finegray.relapse.adj)
+# round estimates to 2 digits
+round(exp(cbind(HR = coef(finegray.relapse.adj), 
+                confint(finegray.relapse.adj))),2)
+                
+```
+
